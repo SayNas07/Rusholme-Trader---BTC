@@ -60,11 +60,24 @@ FIELDS = {
 }
 
 
+def to_pd(obj):
+    """Convert whatever xbbg returns (pandas, Narwhals, Arrow, Polars) to a pandas DataFrame."""
+    if obj is None:
+        return pd.DataFrame()
+    if isinstance(obj, pd.DataFrame):
+        return obj
+    if hasattr(obj, "to_native"):          # Narwhals wrapper -> underlying Arrow/Polars/pandas
+        return to_pd(obj.to_native())
+    if hasattr(obj, "to_pandas"):          # pyarrow.Table / polars.DataFrame
+        return obj.to_pandas()
+    return pd.DataFrame(obj)
+
+
 def long_to_wide(df):
     """xbbg may return long (ticker, field, value) or wide; normalise to wide."""
-    if df is None or len(df) == 0:
-        return pd.DataFrame()
-    df = pd.DataFrame(df)
+    df = to_pd(df)
+    if len(df) == 0:
+        return df
     if {"ticker", "field", "value"}.issubset(df.columns):
         return df.pivot(index="ticker", columns="field", values="value")
     return df
@@ -74,7 +87,7 @@ print("Fetching snapshot...")
 parts = []
 for fld in FIELDS:
     try:
-        parts.append(long_to_wide(blp.bdp(TICKERS, fld)))
+        parts.append(long_to_wide(blp.bdp(TICKERS, fld, backend="pandas")))
     except Exception as e:
         print(f"  skipped {fld}: {e}")
 snap = pd.concat(parts, axis=1) if parts else pd.DataFrame(index=TICKERS)
@@ -89,11 +102,11 @@ for c in ["price", "mkt_cap", "high_52w", "low_52w", "analyst_target",
 print("Fetching price history...")
 end = date.today()
 start = end - timedelta(days=370)
-px = pd.DataFrame(blp.bdh(TICKERS, "PX_LAST", start.isoformat(), end.isoformat()))
+px = to_pd(blp.bdh(TICKERS, "PX_LAST", start.isoformat(), end.isoformat(), backend="pandas"))
 if isinstance(px.columns, pd.MultiIndex):        # (ticker, field) columns
     px.columns = px.columns.get_level_values(0)
 elif {"ticker", "date", "value"}.issubset(px.columns):  # long format
-    px = px.pivot(index="date", columns="ticker", values="value")
+    px = px.pivot_table(index="date", columns="ticker", values="value", aggfunc="last")
 px.index = pd.to_datetime(px.index)
 px = px.apply(pd.to_numeric, errors="coerce").sort_index()
 
