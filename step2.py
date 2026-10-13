@@ -43,7 +43,7 @@ WATCH = {
 # Optional: add tickers from a Bloomberg EQS export, e.g.  python step2.py XML5070R.xlsx
 for path in sys.argv[1:]:
     eqs = pd.read_excel(path, header=None)
-    for t in eqs[0].astype(str).str.strip():
+    for t in eqs[0].dropna().astype(str).str.strip():
         if t.endswith(" Equity") and t not in WATCH:
             WATCH[t] = ("EQS screen", "check catalyst date")
 TICKERS = list(WATCH)
