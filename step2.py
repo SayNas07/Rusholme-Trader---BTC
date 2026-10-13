@@ -54,6 +54,7 @@ FIELDS = {
     "TOT_ANALYST_REC": "n_analysts",
     "SHORT_INT_RATIO": "days_to_cover",
     "BS_CASH_NEAR_CASH_ITEM": "cash",
+    "BS_CASH_CASH_EQUIVALENTS_AND_STI": "cash_sti",  # incl. short-term investments (biotechs park cash there)
     "CF_FREE_CASH_FLOW": "fcf_ltm",
     "VOLATILITY_30D": "hist_vol_30d",
     "EXPECTED_REPORT_DT": "next_earnings",
@@ -94,7 +95,7 @@ snap = pd.concat(parts, axis=1) if parts else pd.DataFrame(index=TICKERS)
 snap.columns = [FIELDS.get(str(c).upper(), str(c)) for c in snap.columns]
 snap = snap.reindex(TICKERS)
 for c in ["price", "mkt_cap", "high_52w", "low_52w", "analyst_target",
-          "rec_consensus", "n_analysts", "days_to_cover", "cash", "fcf_ltm", "hist_vol_30d"]:
+          "rec_consensus", "n_analysts", "days_to_cover", "cash", "cash_sti", "fcf_ltm", "hist_vol_30d"]:
     if c in snap:
         snap[c] = pd.to_numeric(snap[c], errors="coerce")
 
@@ -136,7 +137,12 @@ if "high_52w" in out:
 if "analyst_target" in out:
     out["upside_to_target"] = out["analyst_target"] / out["price"] - 1
 if "cash" in out and "mkt_cap" in out:
-    out["cash_pct_mktcap"] = out["cash"] / out["mkt_cap"]
+    # BDP cash/FCF are in millions (reporting currency); mkt_cap is in USD
+    liq = out["cash_sti"].fillna(out["cash"]) if "cash_sti" in out else out["cash"]
+    out["cash_pct_mktcap"] = liq * 1e6 / out["mkt_cap"]
+    if "fcf_ltm" in out:
+        burn = (-out["fcf_ltm"]).where(out["fcf_ltm"] < 0)
+        out["runway_months"] = liq / burn * 12
 
 # Flags based on our filter (non-penny, ideally $0.5-5bn for 2-4x potential)
 def flags(r):
@@ -154,6 +160,8 @@ def flags(r):
         f.append("ALREADY RAN >50% 3M")
     if r.get("cash_pct_mktcap", 0) > 0.5:
         f.append("CASH-RICH")
+    if r.get("runway_months", np.inf) < 12:
+        f.append("DILUTION RISK<12m")
     return ", ".join(f)
 
 out["flags"] = out.apply(flags, axis=1)
@@ -163,7 +171,7 @@ snap.to_csv("watchlist_snapshot.csv")
 px.to_csv("watchlist_prices.csv")
 cols = ["group", "catalyst", "name", "price", "mkt_cap_bn", "ret_1m", "ret_3m", "ret_1y",
         "off_52w_high", "upside_to_target", "rec_consensus", "days_to_cover",
-        "cash_pct_mktcap", "hist_vol_30d", "next_earnings", "flags"]
+        "cash_pct_mktcap", "runway_months", "hist_vol_30d", "next_earnings", "flags"]
 cols = [c for c in cols if c in out]
 out[cols].to_csv("watchlist_summary.csv")
 
