@@ -39,6 +39,13 @@ WATCH = {
     # Benchmark: last year's winner
     "PRAX US Equity": ("Benchmark", "2025 winner"),
 }
+
+# Optional: add tickers from a Bloomberg EQS export, e.g.  python step2.py XML5070R.xlsx
+for path in sys.argv[1:]:
+    eqs = pd.read_excel(path, header=None)
+    for t in eqs[0].dropna().astype(str).str.strip():
+        if t.endswith(" Equity") and t not in WATCH:
+            WATCH[t] = ("EQS screen", "check catalyst date")
 TICKERS = list(WATCH)
 
 # ---------- 2. Snapshot fields (fetched one by one so a bad field can't break the run) ----------
@@ -162,6 +169,9 @@ def flags(r):
         f.append("CASH-RICH")
     if r.get("runway_months", np.inf) < 12:
         f.append("DILUTION RISK<12m")
+    if (r.get("price", 0) >= 5 and 0.5 <= cap <= 5 and r.get("ret_3m", 0) < 0.5
+            and not r.get("runway_months", np.inf) < 12):
+        f.append("PASSES FILTER")
     return ", ".join(f)
 
 out["flags"] = out.apply(flags, axis=1)
@@ -174,6 +184,8 @@ cols = ["group", "catalyst", "name", "price", "mkt_cap_bn", "ret_1m", "ret_3m", 
         "cash_pct_mktcap", "runway_months", "hist_vol_30d", "next_earnings", "flags"]
 cols = [c for c in cols if c in out]
 out[cols].to_csv("watchlist_summary.csv")
+out[out["flags"].str.contains("PASSES FILTER")][cols].sort_values(
+    "upside_to_target", ascending=False).to_csv("watchlist_candidates.csv")
 
 pd.set_option("display.width", 250, "display.max_columns", 30)
 pct = ["ret_1m", "ret_3m", "ret_1y", "off_52w_high", "upside_to_target", "cash_pct_mktcap"]
@@ -185,4 +197,4 @@ for g, grp in show.groupby("group", sort=False):
     print(f"\n=== {g} ===")
     print(grp.drop(columns=["group"]).round(2).to_string())
 
-print("\nSaved: watchlist_summary.csv, watchlist_snapshot.csv, watchlist_prices.csv")
+print("\nSaved: watchlist_candidates.csv (filter passes), watchlist_summary.csv, watchlist_snapshot.csv, watchlist_prices.csv")
