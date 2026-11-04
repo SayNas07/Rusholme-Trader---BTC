@@ -14,11 +14,14 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 import argparse
 import re
+import warnings
 from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 from xbbg import blp
+
+warnings.filterwarnings("ignore", category=FutureWarning)   # xbbg "ticker" -> "security" rename notice
 
 # ---------- 1. Config ----------
 TICKERS = ["PRAX", "CRWV", "PLUG", "RGTI", "AMAT",
@@ -49,7 +52,7 @@ SNAP = {
     "rec":          ["EQY_REC_CONS"],
     "dtc":          ["SHORT_INT_RATIO"],
     "short_int":    ["SHORT_INT"],
-    "short_pct_fl": ["EQY_SHORT_INT_PCT_FLOAT", "SHORT_INT_PCT_FLOAT"],
+    "short_pct_fl": ["SI_PERCENT_EQUITY_FLOAT", "EQY_SHORT_INT_PCT_FLOAT", "SHORT_INT_PCT_FLOAT"],
     "vol_30d":      ["VOLATILITY_30D"],
     "iv_30d":       ["30DAY_IMPVOL_100.0%MNY_DF"],
     "iv_3m":        ["3MTH_IMPVOL_100.0%MNY_DF"],
@@ -59,6 +62,8 @@ SNAP = {
     "pc_vol":       ["PUT_CALL_VOLUME_RATIO_CUR_DAY"],
 }
 EARN_HIST_FIELDS = ["EARN_ANN_DT_TIME_HIST_WITH_EPS", "ERN_ANN_DT_AND_PER"]
+QTR_PERIODS = ["1BQ", "1FQ"]     # BEST_FPERIOD_OVERRIDE candidates for the next unreported quarter
+FY_PERIODS = ["1BF", "1FY"]
 EPS_REV_DIRECT = ["BEST_EPS_4WK_CHG", "BEST_EPS_4WK_PCT_CHG", "BEST_EPS_1M_CHG"]
 
 
@@ -109,6 +114,7 @@ def bdp_series(tickers, fld, **overrides):
 
 
 RESOLVED = {}
+PARSE_INFO = {}      # which earnings-history columns were picked (first ticker), for debugging
 
 
 def resolve(label, candidates, tickers, **overrides):
@@ -170,19 +176,33 @@ def rev_from_hist(h, days=28):
     return pd.Series(out, dtype=float)
 
 
-def revisions(label, fld, period, tickers, today, direct=None):
-    """4-week % revision as a decimal. Uses a direct Bloomberg field if one exists, else BDH of the consensus."""
-    ovr = {"BEST_FPERIOD_OVERRIDE": period}
-    if direct:
-        s = resolve(label, direct, tickers, **ovr)
+def revisions(label, fld, periods, tickers, today, direct=None):
+    """4-week % revision as a decimal. For each period override, tries a direct Bloomberg field (if given),
+    then a BDH of the consensus series. Returns the first that produces data."""
+    for period in periods:
+        ovr = {"BEST_FPERIOD_OVERRIDE": period}
+        if direct:
+            s = resolve(label, direct, tickers, **ovr)
+            if s is not None:
+                RESOLVED[label] = f"{RESOLVED[label]} [{period}]"
+                return pd.to_numeric(s, errors="coerce") / 100.0     # Bloomberg gives percent
+        h = bdh_wide(tickers, fld, today - timedelta(days=40), today, **ovr)
+        if not h.empty and h.notna().any().any():
+            RESOLVED[label] = f"BDH {fld} [{period}] (computed)"
+            return rev_from_hist(h).reindex(tickers)
+    RESOLVED[label] = None
+    return pd.Series(np.nan, index=tickers)
+
+
+def level(label, fld, periods, tickers):
+    """Consensus level for the first override period that returns data."""
+    for period in periods:
+        s = resolve(label, [fld], tickers, BEST_FPERIOD_OVERRIDE=period)
         if s is not None:
-            return pd.to_numeric(s, errors="coerce") / 100.0     # Bloomberg gives percent
-    h = bdh_wide(tickers, fld, today - timedelta(days=40), today, **ovr)
-    if h.empty:
-        RESOLVED[label] = None
-        return pd.Series(np.nan, index=tickers)
-    RESOLVED[label] = f"BDH {fld} [{period}] (computed)"
-    return rev_from_hist(h).reindex(tickers)
+            RESOLVED[label] = f"{fld} [{period}]"
+            return pd.to_numeric(s, errors="coerce")
+    RESOLVED[label] = None
+    return pd.Series(np.nan, index=tickers)
 
 
 # ---------- 4. Past earnings reactions ----------
@@ -224,6 +244,9 @@ def parse_events(raw):
     scol = find("surpris")
     acol = find("actual") or find("eps", excl=("est", "surpris", "time", "consens"))
     ecol = find("estimate", "consensus", "_est", "est_")
+    if not PARSE_INFO:
+        PARSE_INFO.update(date=dcol, time=tcol, surprise=scol, actual=acol, estimate=ecol,
+                          sample=df.head(3).to_string())
     events = []
     for _, r in df.iterrows():
         dt = pd.to_datetime(r[dcol], errors="coerce")
@@ -312,8 +335,8 @@ def score_row(r):
             pts += plus
             sig.append(("+" if plus > 0 else "-") + label)
 
-    check(r["eps_rev_4w"], lambda v: v > 0, 1, "EPSrev")
-    check(r["sales_rev_4w"], lambda v: v > 0, 1, "SALESrev")
+    check(r["eps_rev_used"], lambda v: v > 0, 1, "EPSrev")
+    check(r["sales_rev_used"], lambda v: v > 0, 1, "SALESrev")
     up = r["up_rate"] if r["n_events"] >= MIN_EVENTS_FOR_RATES else np.nan
     check(up, lambda v: v > UP_RATE_MIN, 1, "UPrate")
     check(r["beat_rate"], lambda v: v > BEAT_RATE_MIN, 1, "BEATrate")
@@ -327,10 +350,10 @@ def score_row(r):
 def note(r):
     """Plain-English why / risk for one row."""
     why, risk = [], []
-    if r["eps_rev_4w"] > 0:
-        why.append(f"EPS estimates up {r['eps_rev_4w']*100:.1f}% in 4 weeks")
-    if r["sales_rev_4w"] > 0:
-        why.append(f"sales estimates up {r['sales_rev_4w']*100:.1f}%")
+    if r["eps_rev_used"] > 0:
+        why.append(f"EPS estimates ({r['eps_rev_src']}) up {r['eps_rev_used']*100:.1f}% in 4 weeks")
+    if r["sales_rev_used"] > 0:
+        why.append(f"sales estimates ({r['sales_rev_src']}) up {r['sales_rev_used']*100:.1f}%")
     if r["n_events"] >= MIN_EVENTS_FOR_RATES and r["up_rate"] > 0.5:
         why.append(f"rose after {r['up_rate']:.0%} of its last {int(r['n_events'])} reports "
                    f"(avg {r['avg_move']*100:+.1f}%)")
@@ -389,15 +412,13 @@ def main():
 
     print("Fetching consensus and revisions...")
     ests = pd.DataFrame(index=full_t)
-    eps_q = resolve("eps_q", ["BEST_EPS"], full_t, BEST_FPERIOD_OVERRIDE="1BQ")
-    sales_q = resolve("sales_q", ["BEST_SALES"], full_t, BEST_FPERIOD_OVERRIDE="1BQ")
-    eps_fy = resolve("eps_fy", ["BEST_EPS"], full_t, BEST_FPERIOD_OVERRIDE="1BF")
-    ests["eps_q"] = pd.to_numeric(eps_q, errors="coerce") if eps_q is not None else np.nan
-    ests["sales_q"] = pd.to_numeric(sales_q, errors="coerce") if sales_q is not None else np.nan
-    ests["eps_fy"] = pd.to_numeric(eps_fy, errors="coerce") if eps_fy is not None else np.nan
-    ests["eps_rev_4w"] = revisions("eps_rev_q", "BEST_EPS", "1BQ", full_t, today, direct=EPS_REV_DIRECT)
-    ests["sales_rev_4w"] = revisions("sales_rev_q", "BEST_SALES", "1BQ", full_t, today)
-    ests["eps_fy_rev_4w"] = revisions("eps_rev_fy", "BEST_EPS", "1BF", full_t, today)
+    ests["eps_q"] = level("eps_q", "BEST_EPS", QTR_PERIODS, full_t)
+    ests["sales_q"] = level("sales_q", "BEST_SALES", QTR_PERIODS, full_t)
+    ests["eps_fy"] = level("eps_fy", "BEST_EPS", FY_PERIODS, full_t)
+    ests["eps_rev_4w"] = revisions("eps_rev_q", "BEST_EPS", QTR_PERIODS, full_t, today, direct=EPS_REV_DIRECT)
+    ests["sales_rev_4w"] = revisions("sales_rev_q", "BEST_SALES", QTR_PERIODS, full_t, today)
+    ests["eps_fy_rev_4w"] = revisions("eps_rev_fy", "BEST_EPS", FY_PERIODS, full_t, today)
+    ests["sales_fy_rev_4w"] = revisions("sales_rev_fy", "BEST_SALES", FY_PERIODS, full_t, today)
 
     print("Fetching price history...")
     px = bdh_wide(full_t, "PX_LAST", today - timedelta(days=900), today)
@@ -434,6 +455,19 @@ def main():
     df["in_window"] = df["report_dt"].between(w0, w1)
     df["timing"] = df["hist_timing"].map({"AMC": "post-mkt", "BMO": "pre-mkt"}).fillna("?")
 
+    # revisions: next-quarter consensus if available, else fiscal-year consensus as a proxy
+    df["eps_rev_used"] = df["eps_rev_4w"].fillna(df["eps_fy_rev_4w"])
+    df["eps_rev_src"] = np.where(df["eps_rev_4w"].notna(), "Q", "FY")
+    df["sales_rev_used"] = df["sales_rev_4w"].fillna(df["sales_fy_rev_4w"])
+    df["sales_rev_src"] = np.where(df["sales_rev_4w"].notna(), "Q", "FY")
+    # sanity check: real companies beat EPS most of the time, so a very low median means a mis-parsed column
+    df["beat_rate_raw"] = df["beat_rate"]
+    if df["beat_rate"].median() < 0.3:
+        print("\n!! Median beat rate is %.0f%% -- implausible, so the beat/estimate columns were probably "
+              "mis-parsed. beat_rate is ignored in the score (raw values kept as beat_rate_raw)." %
+              (df["beat_rate"].median() * 100))
+        df["beat_rate"] = np.nan
+
     sc = df.apply(score_row, axis=1, result_type="expand")
     df["score"], df["signals"], df["signals_have"] = sc[0], sc[1], sc[2]
     df = df.sort_values(["in_window", "score", "up_rate", "avg_abs_move"],
@@ -441,8 +475,8 @@ def main():
     df["rank"] = np.where(df["in_window"], np.arange(1, len(df) + 1), np.nan)
 
     keep = ["rank", "ticker", "name", "report_dt", "timing", "in_window", "price", "mkt_cap_bn",
-            "ret_5d", "ret_1m", "ret_3m", "off_high", "upside_to_target", "rec", "eps_q", "eps_rev_4w",
-            "sales_q", "sales_rev_4w", "eps_fy", "eps_fy_rev_4w", "n_events", "up_rate", "beat_rate",
+            "ret_5d", "ret_1m", "ret_3m", "off_high", "upside_to_target", "rec", "eps_q", "eps_rev_4w", "eps_rev_used", "eps_rev_src", "sales_rev_used", "sales_rev_src",
+            "sales_q", "sales_rev_4w", "sales_fy_rev_4w", "eps_fy", "eps_fy_rev_4w", "n_events", "up_rate", "beat_rate", "beat_rate_raw",
             "avg_move", "avg_abs_move", "last_move", "iv", "iv_move", "exp_move", "skew_90_110",
             "dtc", "short_pct_fl", "pc_oi", "pc_vol", "vol_30d", "score", "signals", "signals_have"]
     df[[c for c in keep if c in df]].to_csv("earnings_scan.csv", index=False)
@@ -460,8 +494,8 @@ def main():
         "cap$bn": df["mkt_cap_bn"].map(lambda v: num(v, "{:.2f}")),
         "1m%": df["ret_1m"].map(pct),
         "offHi%": df["off_high"].map(pct),
-        "EPSrev%": df["eps_rev_4w"].map(pct),
-        "SLSrev%": df["sales_rev_4w"].map(pct),
+        "EPSrev%": df["eps_rev_used"].map(pct),
+        "SLSrev%": df["sales_rev_used"].map(pct),
         "up%": df["up_rate"].map(pct0),
         "beat%": df["beat_rate"].map(pct0),
         "avg|mv|%": df["avg_abs_move"].map(lambda v: "" if pd.isna(v) else f"{v*100:.1f}"),
@@ -482,6 +516,11 @@ def main():
         print(f"\n{r['ticker']} (score {int(r['score'])}, {r['signals'] or 'no signals'})")
         print(f"  Why:  {why}.")
         print(f"  Risk: {risk}.")
+
+    print("\nEarnings-history columns picked: " +
+          ", ".join(f"{k}={v}" for k, v in PARSE_INFO.items() if k != "sample") +
+          "\nFirst rows of the earnings-history table (paste this if beat rates look wrong):\n" +
+          PARSE_INFO.get("sample", "(none)"))
 
     out_of = df[~df["in_window"]]
     if len(out_of):
