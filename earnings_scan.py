@@ -31,6 +31,7 @@ WINDOW = ("2026-11-09", "2026-11-12")      # earnings week to rank
 
 N_EVENTS = 8                # past earnings reactions to use
 MIN_EVENTS_FOR_RATES = 4    # need at least this many to trust up-rate / beat-rate
+REV_MIN = 0.01             # a revision only counts if it moved consensus by more than 1%
 UP_RATE_MIN = 0.60
 BEAT_RATE_MIN = 0.70
 DTC_MIN = 5.0               # days to cover
@@ -213,9 +214,9 @@ def parse_timing(v):
     s = str(v).strip().lower()
     if s in ("", "nan", "nat", "none"):
         return None
-    if "after" in s or "amc" in s or s in ("post", "pm"):
+    if "after" in s or "aft" in s or "amc" in s or s in ("post", "pm"):
         return "AMC"
-    if "before" in s or "bmo" in s or s in ("pre", "am"):
+    if "before" in s or "bef" in s or "bmo" in s or "dur" in s or s in ("pre", "am"):
         return "BMO"
     m = re.search(r"(\d{1,2}):(\d{2})", s)
     if m:
@@ -242,7 +243,7 @@ def parse_events(raw):
         return []
     tcol = find("time", excl=("period",))
     scol = find("surpris")
-    acol = find("actual") or find("eps", excl=("est", "surpris", "time", "consens"))
+    acol = find("comparable") or find("actual") or find("eps", excl=("est", "surpris", "time", "consens"))
     ecol = find("estimate", "consensus", "_est", "est_")
     if not PARSE_INFO:
         PARSE_INFO.update(date=dcol, time=tcol, surprise=scol, actual=acol, estimate=ecol,
@@ -326,17 +327,19 @@ def score_row(r):
     """Simple additive score. Returns (score, signals text, inputs available out of 8)."""
     pts, sig, have = 0, [], 0
 
-    def check(val, cond, plus, label):
+    def check(val, cond, plus, label, count=True):
         nonlocal pts, have
         if val is None or (isinstance(val, float) and np.isnan(val)):
             return
-        have += 1
+        have += count
         if cond(val):
             pts += plus
             sig.append(("+" if plus > 0 else "-") + label)
 
-    check(r["eps_rev_used"], lambda v: v > 0, 1, "EPSrev")
-    check(r["sales_rev_used"], lambda v: v > 0, 1, "SALESrev")
+    check(r["eps_rev_used"], lambda v: v > REV_MIN, 1, "EPSrev")
+    check(r["eps_rev_used"], lambda v: v < -REV_MIN, -1, "EPScut", count=False)
+    check(r["sales_rev_used"], lambda v: v > REV_MIN, 1, "SALESrev")
+    check(r["sales_rev_used"], lambda v: v < -REV_MIN, -1, "SALEScut", count=False)
     up = r["up_rate"] if r["n_events"] >= MIN_EVENTS_FOR_RATES else np.nan
     check(up, lambda v: v > UP_RATE_MIN, 1, "UPrate")
     check(r["beat_rate"], lambda v: v > BEAT_RATE_MIN, 1, "BEATrate")
@@ -350,9 +353,9 @@ def score_row(r):
 def note(r):
     """Plain-English why / risk for one row."""
     why, risk = [], []
-    if r["eps_rev_used"] > 0:
+    if r["eps_rev_used"] > REV_MIN:
         why.append(f"EPS estimates ({r['eps_rev_src']}) up {r['eps_rev_used']*100:.1f}% in 4 weeks")
-    if r["sales_rev_used"] > 0:
+    if r["sales_rev_used"] > REV_MIN:
         why.append(f"sales estimates ({r['sales_rev_src']}) up {r['sales_rev_used']*100:.1f}%")
     if r["n_events"] >= MIN_EVENTS_FOR_RATES and r["up_rate"] > 0.5:
         why.append(f"rose after {r['up_rate']:.0%} of its last {int(r['n_events'])} reports "
@@ -365,6 +368,10 @@ def note(r):
         why.append(f"options lean bullish (put/call {r['pc']:.2f})")
     if not np.isnan(r["exp_move"]):
         why.append(f"expected move about ±{r['exp_move']*100:.0f}%")
+    if r["eps_rev_used"] < -REV_MIN:
+        risk.append(f"analysts cutting EPS estimates ({r['eps_rev_used']*100:.1f}% in 4 weeks)")
+    if r["sales_rev_used"] < -REV_MIN:
+        risk.append(f"analysts cutting sales estimates ({r['sales_rev_used']*100:.1f}% in 4 weeks)")
     if r["ret_1m"] > 0.15:
         risk.append(f"already +{r['ret_1m']*100:.0f}% in 1 month, so good news may be priced in")
     if r["avg_abs_move"] > 0.15:
@@ -456,10 +463,13 @@ def main():
     df["timing"] = df["hist_timing"].map({"AMC": "post-mkt", "BMO": "pre-mkt"}).fillna("?")
 
     # revisions: next-quarter consensus if available, else fiscal-year consensus as a proxy
-    df["eps_rev_used"] = df["eps_rev_4w"].fillna(df["eps_fy_rev_4w"])
-    df["eps_rev_src"] = np.where(df["eps_rev_4w"].notna(), "Q", "FY")
-    df["sales_rev_used"] = df["sales_rev_4w"].fillna(df["sales_fy_rev_4w"])
-    df["sales_rev_src"] = np.where(df["sales_rev_4w"].notna(), "Q", "FY")
+    def pick(q, fy):
+        use_q = q.abs() >= REV_MIN
+        val = q.where(use_q, fy.where(fy.notna(), q))
+        src = np.where(use_q, "Q", np.where(fy.notna(), "FY", "Q"))
+        return val, src
+    df["eps_rev_used"], df["eps_rev_src"] = pick(df["eps_rev_4w"], df["eps_fy_rev_4w"])
+    df["sales_rev_used"], df["sales_rev_src"] = pick(df["sales_rev_4w"], df["sales_fy_rev_4w"])
     # sanity check: real companies beat EPS most of the time, so a very low median means a mis-parsed column
     df["beat_rate_raw"] = df["beat_rate"]
     if df["beat_rate"].median() < 0.3:
@@ -544,8 +554,9 @@ def main():
               "FLDS PUT CALL RATIO, FLDS IMPLIED VOLATILITY 30 DAY, FLDS EPS 4 WEEK CHANGE) and "
               "send me the mnemonic.")
     print("\nSaved: earnings_scan.csv")
-    print("Scoring: +1 each for EPS rev>0, sales rev>0, up-rate>60%, beat-rate>70%, DTC>5, put/call<1; "
-          "-1 each for 1m return>25%, expected move<8%. Blank inputs score 0 (see signals_have in the CSV).")
+    print("Scoring: +1 each for EPS rev>+1%, sales rev>+1%, up-rate>60%, beat-rate>70%, DTC>5, put/call<1; "
+          "-1 each for EPS or sales rev<-1%, 1m return>25%, expected move<8%. "
+          "Blank inputs score 0 (see signals_have in the CSV).")
     print("Research only, not investment advice.")
 
 
