@@ -23,6 +23,7 @@ pip install --user "xbbg[pandas]" openpyxl
 |---|---|
 | `main.py` | Connection test. Fetches `PX_LAST` and `CUR_MKT_CAP` for four tickers and writes `watchlist.csv`. |
 | `step2.py` | Main analysis. Fetches the snapshot, price history and metrics, then writes the CSVs below. |
+| `earnings_scan.py` | Ranks tickers reporting in a given week by how likely a positive earnings reaction is. See [Earnings scan](#earnings-scan). |
 
 ## Usage
 
@@ -73,6 +74,22 @@ python step2.py XML5070R.xlsx
 | `PASSES FILTER` | Price ≥ $5, cap $0.5–5B, 3-month return under 50%, no dilution flag |
 
 `PASSES FILTER` does not check for catalysts. The catalyst dates in `step2.py` are entered by hand and need checking against company releases, FDA calendars and SEC filings.
+
+## Earnings scan
+
+```
+python earnings_scan.py
+python earnings_scan.py --tickers PRAX,AMAT --start 2026-11-09 --end 2026-11-12
+```
+
+Pulls a snapshot (price, cap, short interest, implied vol, put/call), 4-week estimate revisions, 1-year price momentum, and the last 8 earnings reactions for each ticker, then writes `earnings_scan.csv` and prints a ranked table plus a short note on the top 5.
+
+Score (each component shows in the `signals` column): +1 for EPS revisions > 0, sales revisions > 0, post-earnings up-rate > 60%, EPS beat-rate > 70%, days to cover > 5, put/call < 1; -1 for a 1-month return > 25% and for an expected move < 8%. Blank inputs score 0, and `signals_have` in the CSV shows how many of the 8 inputs were available.
+
+- **Reaction timing:** after-close reports use day 0 to day +1, before-open and intraday reports use day -1 to day 0, and unknown timing uses day -1 to day +1.
+- **Expected move:** the larger of an IV-based proxy (`0.8 x 30-day IV x sqrt(7/365)`) and the average absolute past move. The proxy usually understates a true earnings-straddle price.
+- **Field names:** each field has candidate mnemonics and the run prints which one worked. For any that come back `UNRESOLVED`, look the field up with `FLDS` on the Terminal.
+- **Window:** tickers whose `EXPECTED_REPORT_DT` is outside `--start/--end` are ranked last with rank `-`.
 
 ## Editing the watchlist
 
